@@ -1,7 +1,8 @@
 # .github/workflows/buffer_health.yml
 # Daily health check — query Buffer GraphQL for past-24h posts, alert Slack if any failed.
-# NOTE: uses api.buffer.com (Buffer GraphQL) with Bearer token auth.
-# graph.buffer.com redirects to api.buffer.com as of 2026-04.
+# NOTE: uses api.buffer.com (Buffer v2 GraphQL) with Bearer token auth.
+# api.buffer.com schema uses input objects; Channel type has no posts field —
+# posts are queried top-level filtered by channelIds + dueAt range.
 
 name: Buffer Health Check
 
@@ -31,6 +32,7 @@ jobs:
           const channelIds = (process.env.BUFFER_CHANNEL_IDS || '').split(',').filter(Boolean);
           const slack      = process.env.SLACK_WEBHOOK_URL;
           const token      = process.env.BUFFER_ACCESS_TOKEN;
+          const now        = new Date().toISOString();
           const since      = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
           const GQL        = 'https://api.buffer.com';
 
@@ -47,33 +49,46 @@ jobs:
             return r.json();
           };
 
-          const Q = `query Posts($channelId: String!, $after: String) {
-            channel(id: $channelId) {
-              posts(status: sent, first: 50, after: $after) {
-                edges { node { id status dueAt text } }
-                pageInfo { hasNextPage endCursor }
+          // Get org ID dynamically
+          const accountRes = await gql('{ account { currentOrganization { id } } }');
+          const orgId = accountRes?.data?.account?.currentOrganization?.id;
+          if (!orgId) {
+            console.error('Failed to get org ID', JSON.stringify(accountRes).slice(0, 300));
+            process.exit(1);
+          }
+
+          const Q = `query Posts($after: String) {
+            posts(
+              input: {
+                organizationId: "${orgId}",
+                filter: {
+                  channelIds: ${JSON.stringify(channelIds)},
+                  dueAt: { start: "${since}", end: "${now}" }
+                }
               }
+              first: 50
+              after: $after
+            ) {
+              edges { node { id status dueAt text } }
+              pageInfo { hasNextPage endCursor }
             }
           }`;
 
           const failed = [];
+          let cursor = null;
+          let hasMore = true;
 
-          for (const chId of channelIds) {
-            let cursor = null;
-            let hasMore = true;
-            while (hasMore) {
-              const r = await gql(Q, { channelId: chId, after: cursor });
-              const conn = r?.data?.channel?.posts;
-              if (!conn) { console.warn('No data for channel', chId, JSON.stringify(r).slice(0, 200)); break; }
-              for (const { node } of (conn.edges || [])) {
-                if (node.dueAt < since) continue;
-                if (node.status !== 'sent') {
-                  failed.push({ channel: chId, id: node.id, status: node.status, text: (node.text || '').slice(0, 80) });
-                }
+          while (hasMore) {
+            const r = await gql(Q, { after: cursor });
+            const conn = r?.data?.posts;
+            if (!conn) { console.warn('No post data', JSON.stringify(r).slice(0, 300)); break; }
+            for (const { node } of (conn.edges || [])) {
+              if (node.status !== 'sent') {
+                failed.push({ id: node.id, status: node.status, dueAt: node.dueAt, text: (node.text || '').slice(0, 80) });
               }
-              hasMore = conn.pageInfo?.hasNextPage;
-              cursor  = conn.pageInfo?.endCursor;
             }
+            hasMore = conn.pageInfo?.hasNextPage;
+            cursor  = conn.pageInfo?.endCursor;
           }
 
           if (failed.length === 0) {
