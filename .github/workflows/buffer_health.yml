@@ -1,0 +1,95 @@
+# .github/workflows/buffer_health.yml
+# Daily health check — query Buffer GraphQL for past-24h posts, alert Slack if any failed.
+# NOTE: uses graph.buffer.com (Buffer v2 GraphQL) with Bearer token auth.
+# The old api.bufferapp.com/1/ endpoint rejects the current token type.
+
+name: Buffer Health Check
+
+on:
+  schedule:
+    # 22:00 UTC daily (17:00 Bogota)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Run health check
+        env:
+          BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN }}
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+          BUFFER_CHANNEL_IDS:  ${{ secrets.BUFFER_CHANNEL_IDS }}  # comma-separated channel ids
+        run: |
+          node <<'JS'
+          const channelIds = (process.env.BUFFER_CHANNEL_IDS || '').split(',').filter(Boolean);
+          const slack      = process.env.SLACK_WEBHOOK_URL;
+          const token      = process.env.BUFFER_ACCESS_TOKEN;
+          const since      = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+          const GQL        = 'https://graph.buffer.com';
+
+          const gql = async (query, variables) => {
+            const r = await fetch(GQL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-buffer-client-id': 'webapp-publish',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            return r.json();
+          };
+
+          const Q = `query Posts($channelId: String!, $after: String) {
+            channel(id: $channelId) {
+              posts(status: sent, first: 50, after: $after) {
+                edges { node { id status dueAt text } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }`;
+
+          const failed = [];
+
+          for (const chId of channelIds) {
+            let cursor = null;
+            let hasMore = true;
+            while (hasMore) {
+              const r = await gql(Q, { channelId: chId, after: cursor });
+              const conn = r?.data?.channel?.posts;
+              if (!conn) { console.warn('No data for channel', chId, JSON.stringify(r).slice(0, 200)); break; }
+              for (const { node } of (conn.edges || [])) {
+                if (node.dueAt < since) continue;
+                if (node.status !== 'sent') {
+                  failed.push({ channel: chId, id: node.id, status: node.status, text: (node.text || '').slice(0, 80) });
+                }
+              }
+              hasMore = conn.pageInfo?.hasNextPage;
+              cursor  = conn.pageInfo?.endCursor;
+            }
+          }
+
+          if (failed.length === 0) {
+            console.log('All clear — all posts published cleanly in the last 24h.');
+            process.exit(0);
+          }
+
+          console.log('FAILED:', JSON.stringify(failed, null, 2));
+          if (slack) {
+            const text = `⚠ CLP26 Buffer health: ${failed.length} post(s) did not send in last 24h.\n` +
+                         failed.map(f => `• ${f.id} (${f.status}): ${f.text}`).join('\n');
+            await fetch(slack, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text }),
+            });
+          }
+          process.exitCode = 1;
+          JS
