@@ -1,7 +1,7 @@
 # .github/workflows/buffer_health.yml
 # Daily health check — query Buffer GraphQL for past-24h posts, alert Slack if any failed.
-# NOTE: uses graph.buffer.com (Buffer v2 GraphQL) with Bearer token auth.
-# The old api.bufferapp.com/1/ endpoint rejects the current token type.
+# NOTE: uses api.buffer.com (Buffer GraphQL) with Bearer token auth.
+# graph.buffer.com redirects to api.buffer.com as of 2026-04.
 
 name: Buffer Health Check
 
@@ -32,7 +32,7 @@ jobs:
           const slack      = process.env.SLACK_WEBHOOK_URL;
           const token      = process.env.BUFFER_ACCESS_TOKEN;
           const since      = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-          const GQL        = 'https://graph.buffer.com';
+          const GQL        = 'https://api.buffer.com';
 
           const gql = async (query, variables) => {
             const r = await fetch(GQL, {
